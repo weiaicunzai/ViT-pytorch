@@ -1,11 +1,14 @@
 # coding=utf-8
 from __future__ import absolute_import, division, print_function
+import sys
 
 import logging
 import argparse
 import os
+sys.path.append(os.getcwd())
 import random
 import numpy as np
+import time
 
 from datetime import timedelta
 
@@ -14,8 +17,8 @@ import torch.distributed as dist
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from apex import amp
-from apex.parallel import DistributedDataParallel as DDP
+#from apex import amp
+#from apex.parallel import DistributedDataParallel as DDP
 
 from models.modeling import VisionTransformer, CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
@@ -60,6 +63,8 @@ def setup(args):
     config = CONFIGS[args.model_type]
 
     num_classes = 10 if args.dataset == "cifar10" else 100
+    if args.dataset == 'CRC':
+        num_classes = 3
 
     model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
     model.load_from(np.load(args.pretrained_dir))
@@ -86,9 +91,131 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
+#def valid(args, model, writer, test_loader, global_step):
+#    # Validation!
+#    eval_losses = AverageMeter()
+#
+#    logger.info("***** Running Validation *****")
+#    logger.info("  Num steps = %d", len(test_loader))
+#    logger.info("  Batch size = %d", args.eval_batch_size)
+#
+#    model.eval()
+#    all_preds, all_label = [], []
+#    epoch_iterator = tqdm(test_loader,
+#                          desc="Validating... (loss=X.X)",
+#                          bar_format="{l_bar}{r_bar}",
+#                          dynamic_ncols=True,
+#                          disable=args.local_rank not in [-1, 0])
+#    loss_fct = torch.nn.CrossEntropyLoss()
+#    for step, batch in enumerate(epoch_iterator):
+#        batch = tuple(t.to(args.device) for t in batch)
+#        x, y = batch
+#        with torch.no_grad():
+#            logits = model(x)[0]
+#
+#            eval_loss = loss_fct(logits, y)
+#            eval_losses.update(eval_loss.item())
+#
+#            preds = torch.argmax(logits, dim=-1)
+#
+#        if len(all_preds) == 0:
+#            all_preds.append(preds.detach().cpu().numpy())
+#            all_label.append(y.detach().cpu().numpy())
+#        else:
+#            all_preds[0] = np.append(
+#                all_preds[0], preds.detach().cpu().numpy(), axis=0
+#            )
+#            all_label[0] = np.append(
+#                all_label[0], y.detach().cpu().numpy(), axis=0
+#            )
+#        epoch_iterator.set_description("Validating... (loss=%2.5f)" % eval_losses.val)
+#
+#    all_preds, all_label = all_preds[0], all_label[0]
+#    accuracy = simple_accuracy(all_preds, all_label)
+#
+#    logger.info("\n")
+#    logger.info("Validation Results")
+#    logger.info("Global Steps: %d" % global_step)
+#    logger.info("Valid Loss: %2.5f" % eval_losses.avg)
+#    logger.info("Valid Accuracy: %2.5f" % accuracy)
+#
+#    writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
+#    return accuracy
+
+class Metric:
+    def __init__(self, normal_class_id=0):
+        self.normal_class_id = normal_class_id
+        self.image_prefix = dict()
+        self.image_label = dict()
+        #self.patch_acc = 0
+        #self.image_acc_mul = 0
+        #self.image_acc_bin = 0
+
+        self.total_patches = 0
+        self.correct_patches = 0
+
+        self.total_images = [0, 0, 0] # grade 1 grade 2 grade 3
+        self.correct_images = [0, 0, 0]
+
+    def update(self, preds, labels, pathes):
+        #if not self.image_prefix:
+        self.correct_patches += preds.cpu().eq(labels.cpu()).sum().item()
+        self.total_patches += len(labels)
+
+        preds = preds.tolist()
+        labels = labels.tolist()
+        #
+        for pred, label, path in zip(preds, labels, pathes):
+            prefix = path.split('_grade_')[0]
+            image_label = int(path.split('_grade_')[1][0]) - 1
+            #print(prefix)
+            if prefix not in self.image_prefix:
+                self.image_prefix[prefix] = [0, 0, 0]
+                self.image_label[prefix] = image_label
+
+            # add to image stats
+            self.image_prefix[prefix][pred] += 1
+
+    def patch_accuracy(self):
+        return self.correct_patches / self.total_patches
+
+    def image_acc_three_class(self):
+
+        correct = 0
+        total = 0
+        for key, value in self.image_prefix.items():
+            pred = value.index(max(value))
+            label = self.image_label[key]
+
+            correct += pred == label
+            total += 1
+
+        return correct / total
+
+    def image_acc_binary_class(self):
+        correct = 0
+        total = 0
+
+        for key, value in self.image_prefix.items():
+            pred = value.index(max(value))
+            label = self.image_label[key]
+
+            if label == self.normal_class_id:
+                if pred == self.normal_class_id:
+                    correct += 1
+            else:
+                if pred != self.normal_class_id:
+                    correct += 1
+
+            total += 1
+
+        return correct / total
+
+
 def valid(args, model, writer, test_loader, global_step):
     # Validation!
     eval_losses = AverageMeter()
+    metric = Metric()
 
     logger.info("***** Running Validation *****")
     logger.info("  Num steps = %d", len(test_loader))
@@ -103,8 +230,10 @@ def valid(args, model, writer, test_loader, global_step):
                           disable=args.local_rank not in [-1, 0])
     loss_fct = torch.nn.CrossEntropyLoss()
     for step, batch in enumerate(epoch_iterator):
-        batch = tuple(t.to(args.device) for t in batch)
-        x, y = batch
+        #batch = tuple(t.to(args.device) for t in batch)
+        x, y, path = batch
+        x = x.to(args.device)
+        y = y.to(args.device)
         with torch.no_grad():
             logits = model(x)[0]
 
@@ -112,37 +241,52 @@ def valid(args, model, writer, test_loader, global_step):
             eval_losses.update(eval_loss.item())
 
             preds = torch.argmax(logits, dim=-1)
+            #print(preds)
+            #print(preds.shape)
+            metric.update(preds, y, path)
 
-        if len(all_preds) == 0:
-            all_preds.append(preds.detach().cpu().numpy())
-            all_label.append(y.detach().cpu().numpy())
-        else:
-            all_preds[0] = np.append(
-                all_preds[0], preds.detach().cpu().numpy(), axis=0
-            )
-            all_label[0] = np.append(
-                all_label[0], y.detach().cpu().numpy(), axis=0
-            )
+        #if len(all_preds) == 0:
+        #    all_preds.append(preds.detach().cpu().numpy())
+        #    all_label.append(y.detach().cpu().numpy())
+        #else:
+        #    all_preds[0] = np.append(
+        #        all_preds[0], preds.detach().cpu().numpy(), axis=0
+        #    )
+        #    all_label[0] = np.append(
+        #        all_label[0], y.detach().cpu().numpy(), axis=0
+        #    )
         epoch_iterator.set_description("Validating... (loss=%2.5f)" % eval_losses.val)
 
-    all_preds, all_label = all_preds[0], all_label[0]
-    accuracy = simple_accuracy(all_preds, all_label)
+    #all_preds, all_label = all_preds[0], all_label[0]
+    #accuracy = simple_accuracy(all_preds, all_label)
+
+    patch_acc = metric.patch_accuracy()
+    image_acc_three = metric.image_acc_three_class()
+    image_acc_bin = metric.image_acc_binary_class()
+
 
     logger.info("\n")
     logger.info("Validation Results")
     logger.info("Global Steps: %d" % global_step)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
-    logger.info("Valid Accuracy: %2.5f" % accuracy)
+    logger.info("Valid Patch Accuracy: %2.5f" % patch_acc)
+    logger.info("Valid Image Three-Class Accuracy: %2.5f" % image_acc_three)
+    logger.info("Valid Image Binary-Class Accuracy: %2.5f" % image_acc_bin)
 
-    writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
-    return accuracy
-
+    writer.add_scalar("test/patch accuracy", scalar_value=patch_acc, global_step=global_step)
+    writer.add_scalar("test/binary_accuracy", scalar_value=image_acc_three, global_step=global_step)
+    writer.add_scalar("test/image_accuracy", scalar_value=image_acc_bin, global_step=global_step)
+    return image_acc_three, image_acc_bin, patch_acc
 
 def train(args, model):
     """ Train the model """
     if args.local_rank in [-1, 0]:
-        os.makedirs(args.output_dir, exist_ok=True)
-        writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
+        from datetime import datetime
+        date_fmt = '%A_%d_%B_%Y_%Hh_%Mm_%Ss'
+        date_now = datetime.now().strftime(date_fmt)
+        os.makedirs(os.path.join(args.output_dir, args.dataset, date_now), exist_ok=True)
+        os.makedirs(os.path.join('logs', args.dataset, date_now), exist_ok=True)
+        writer = SummaryWriter(log_dir=os.path.join("logs", args.dataset, date_now, args.name))
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
@@ -160,11 +304,11 @@ def train(args, model):
     else:
         scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
-    if args.fp16:
-        model, optimizer = amp.initialize(models=model,
-                                          optimizers=optimizer,
-                                          opt_level=args.fp16_opt_level)
-        amp._amp_state.loss_scalers[0]._loss_scale = 2**20
+    #if args.fp16:
+    #    model, optimizer = amp.initialize(models=model,
+    #                                      optimizers=optimizer,
+    #                                      opt_level=args.fp16_opt_level)
+    #    amp._amp_state.loss_scalers[0]._loss_scale = 2**20
 
     # Distributed training
     if args.local_rank != -1:
@@ -183,6 +327,8 @@ def train(args, model):
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
     losses = AverageMeter()
     global_step, best_acc = 0, 0
+    best_bin = 0
+    best_patch = 0
     while True:
         model.train()
         epoch_iterator = tqdm(train_loader,
@@ -190,7 +336,14 @@ def train(args, model):
                               bar_format="{l_bar}{r_bar}",
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0])
+
+        #time_start = time.time()
+
+        print(len(train_loader), 33333333)
         for step, batch in enumerate(epoch_iterator):
+            #time_end = time.time()
+            #load_time = time_end - time_start
+
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
             loss = model(x, y)
@@ -221,13 +374,23 @@ def train(args, model):
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
                     writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
                 if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                    accuracy = valid(args, model, writer, test_loader, global_step)
+                    accuracy, binary, patch = valid(args, model, writer, test_loader, global_step)
                     if best_acc < accuracy:
                         save_model(args, model)
                         best_acc = accuracy
+
+                    best_bin = max(best_bin, binary)
+                    best_patch = max(best_bin, patch)
+                    #if best_bin < binary:
+                    print('best three class acc:', best_acc)
+                    print('best binary class acc:', best_bin)
+                    print('best patch level acc:', patch)
+
                     model.train()
 
-                if global_step % t_total == 0:
+            #time_start = time.time()
+            #print(load_time / (time_start - time_end + load_time))
+            if global_step % t_total == 0:
                     break
         losses.reset()
         if global_step % t_total == 0:
@@ -244,7 +407,7 @@ def main():
     # Required parameters
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10",
+    parser.add_argument("--dataset", choices=["cifar10", "cifar100", "CRC", "ECRC"], default="cifar10",
                         help="Which downstream task.")
     parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
                                                  "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
@@ -257,7 +420,7 @@ def main():
 
     parser.add_argument("--img_size", default=224, type=int,
                         help="Resolution size")
-    parser.add_argument("--train_batch_size", default=512, type=int,
+    parser.add_argument("--train_batch_size", default=32, type=int,
                         help="Total batch size for training.")
     parser.add_argument("--eval_batch_size", default=64, type=int,
                         help="Total batch size for eval.")
@@ -282,6 +445,8 @@ def main():
                         help="local_rank for distributed training on gpus")
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
+    parser.add_argument('--cv', type=int, required=True,
+                        help="cross validation fold number")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
     parser.add_argument('--fp16', action='store_true',
