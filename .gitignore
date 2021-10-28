@@ -166,7 +166,6 @@ res2
 *.png
 ttt_del.py
 config.py
-datasets/
 logs/
 output/
 run.py
